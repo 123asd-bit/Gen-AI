@@ -1,0 +1,77 @@
+from diffusers import StableDiffusionPipeline
+import torch
+import os
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16
+)
+pipe = pipe.to("cuda")
+
+os.makedirs("synthetic_data", exist_ok=True)
+
+prompts = [
+    "A cat sitting on a sofa",
+    "A dog playing in a park",
+    "A mountain landscape",
+    "A futuristic city",
+    "A robot reading a book"
+]
+
+for i, prompt in enumerate(prompts):
+    image = pipe(prompt).images[0]
+    image.save(f"synthetic_data/image_{i+1}.png")
+from PIL import Image
+import matplotlib.pyplot as plt
+
+img = Image.open("/kaggle/working/synthetic_data/image_1.png")
+plt.imshow(img)
+plt.axis("off")
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+img = Image.open("/kaggle/working/synthetic_data/image_2.png")
+plt.imshow(img)
+plt.axis("off")
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+img = Image.open("/kaggle/working/synthetic_data/image_3.png")
+plt.imshow(img)
+plt.axis("off")
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+img = Image.open("/kaggle/working/synthetic_data/image_4.png")
+plt.imshow(img)
+plt.axis("off")
+
+!pip install ftfy regex tqdm
+!pip install git+https://github.com/openai/CLIP.git
+
+import clip
+from PIL import Image
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, preprocess = clip.load("ViT-B/32", device=device)
+image = preprocess(Image.open("synthetic_data/image_1.png")).unsqueeze(0).to(device)
+
+  texts = [
+    "a cat sitting on a sofa",
+    "a dog playing in a park",
+    "a mountain landscape",
+    "a robot reading a book"
+]
+
+text_tokens = clip.tokenize(texts).to(device)
+with torch.no_grad():
+    image_features = model.encode_image(image)
+    text_features = model.encode_text(text_tokens)
+
+    similarity = (image_features @ text_features.T).softmax(dim=-1)
+
+print("Similarity scores:", similarity)
+best_match = similarity.argmax().item()
+print("Predicted description:", texts[best_match])
