@@ -1,0 +1,185 @@
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+model_name = "gpt2"
+
+tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+model = GPT2LMHeadModel.from_pretrained(model_name)
+
+tokenizer.pad_token = tokenizer.eos_token
+model.resize_token_embeddings(len(tokenizer))
+
+def generate_text(prompt, model, tokenizer, max_length=50):
+    inputs = tokenizer(prompt, return_tensors="pt")
+    outputs = model.generate(
+        inputs["input_ids"],
+        max_length=max_length,
+        num_return_sequences=1,
+        no_repeat_ngram_size=2,
+        do_sample=True,
+        top_k=50,
+        top_p=0.95
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+print("🔹 Baseline Output:")
+print(generate_text("this product is", model, tokenizer))product_reviews = """
+this phone has an amazing battery life and the camera quality is outstanding for the price.
+i bought this laptop for college and it handles all my assignments and coding projects perfectly.
+the sound quality of these headphones is incredible with deep bass and clear vocals.
+this smartwatch tracks my steps accurately and the heart rate monitor is very reliable.
+great wireless earbuds with noise cancellation that blocks out all background sound.
+
+the keyboard feels very comfortable for long typing sessions and the backlight is a nice touch.
+this portable charger saved me during travel and it charges my phone three times on a single charge.
+the tablet screen is bright and colorful which makes watching movies a great experience.
+i love this fitness tracker because it motivates me to reach my daily exercise goals.
+this bluetooth speaker is compact but delivers surprisingly loud and clear audio.
+
+the delivery was fast and the product was packed securely with no damage at all.
+excellent value for money and the build quality feels premium despite the affordable price.
+the customer service team was very helpful when i had questions about the product features.
+this camera takes stunning photos in low light and the video recording quality is very smooth.
+i have been using this product for three months and it still works perfectly like day one.
+
+the design is sleek and modern and it looks great on my desk next to my other gadgets.
+easy to set up right out of the box and the instructions were clear and simple to follow.
+highly recommend this product to anyone looking for quality and reliability at a fair price.
+the software updates keep adding new features which makes this purchase even more worthwhile.
+best purchase i made this year and i would definitely buy from this brand again.
+"""
+
+with open("reviews.txt", "w") as f:
+    f.write(product_reviews)import torch
+from torch.utils.data import Dataset
+
+class CustomTextDataset(Dataset):
+    def __init__(self, tokenizer, file_path, block_size):
+        self.examples = []
+        with open(file_path, encoding="utf-8") as f:
+            text = f.read()
+
+        tokenized_text = tokenizer.encode(text, add_special_tokens=False)
+
+        for i in range(0, len(tokenized_text) - block_size + 1, block_size):
+            self.examples.append(tokenized_text[i : i + block_size]) # Removed build_inputs_with_special_tokens
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        return torch.tensor(self.examples[i], dtype=torch.long)
+
+def load_dataset(file_path, tokenizer):
+    return CustomTextDataset(
+        tokenizer=tokenizer,
+        file_path=file_path,
+        block_size=128
+    )
+
+dataset = load_dataset("reviews.txt", tokenizer)
+
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False
+)
+training_args = TrainingArguments(
+    output_dir="./review_model",
+    num_train_epochs=5,
+    per_device_train_batch_size=2,
+    save_steps=500,
+    save_total_limit=2,
+    logging_steps=100
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    data_collator=data_collator
+)
+
+trainer.train()print("\n🔹 Fine-Tuned Output:")
+print(generate_text("this product is", model, tokenizer))tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+model = GPT2LMHeadModel.from_pretrained("gpt2")
+
+tokenizer.pad_token = tokenizer.eos_token
+model.resize_token_embeddings(len(tokenizer))recipes = """
+to make butter chicken start by marinating chicken pieces in yogurt with turmeric chili powder and garam masala for one hour.
+heat butter in a pan and fry onions until golden brown then add ginger garlic paste and cook for two minutes.
+add tomato puree and cook on low heat for ten minutes until the oil separates from the masala.
+add the marinated chicken and cook on medium heat for fifteen minutes until fully cooked.
+finish with fresh cream and kasuri methi and serve hot with naan or steamed rice.
+
+for pasta carbonara boil spaghetti in salted water until al dente and reserve half cup of pasta water.
+fry diced pancetta in olive oil until crispy and set aside.
+whisk together egg yolks parmesan cheese and black pepper in a bowl.
+toss the hot pasta with pancetta and remove from heat then quickly stir in the egg mixture.
+the residual heat will cook the eggs into a creamy sauce and serve immediately with extra parmesan.
+
+to prepare vegetable stir fry heat sesame oil in a wok on high heat.
+add sliced bell peppers broccoli florets and snap peas and toss for three minutes.
+pour in soy sauce oyster sauce and a pinch of sugar and stir well.
+add minced garlic and ginger and cook for one more minute until fragrant.
+serve the stir fry over steamed jasmine rice and garnish with sesame seeds.
+
+for chocolate chip cookies cream together butter and sugar until light and fluffy.
+beat in eggs one at a time then add vanilla extract and mix well.
+fold in flour baking soda and salt then gently stir in chocolate chips.
+scoop dough onto a baking sheet and bake at 180 degrees for twelve minutes until golden.
+let cookies cool on the tray for five minutes before transferring to a wire rack.
+"""
+
+with open("recipes.txt", "w") as f:
+    f.write(recipes)dataset = load_dataset("recipes.txt", tokenizer)
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(
+        output_dir="./recipe_model",
+        num_train_epochs=5,
+        per_device_train_batch_size=2,
+        logging_steps=100
+    ),
+    train_dataset=dataset,
+    data_collator=data_collator
+)
+
+trainer.train()print("\n🔹 Recipe Output (Fine-Tuned):")
+print(generate_text("butter chicken recipe:", model, tokenizer, max_length=100))def generate_text(prompt, model, tokenizer, max_length=80):
+    inputs = tokenizer(prompt, return_tensors="pt")
+
+    outputs = model.generate(
+        inputs["input_ids"],
+        max_length=max_length,
+        do_sample=True,
+        top_k=50,
+        top_p=0.95,
+        no_repeat_ngram_size=2
+    )
+
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)baseline_outputs = {}
+
+prompts = [
+    "this product is",
+    "the quality of this product",
+    "i bought this item",
+]
+
+for prompt in prompts:
+    baseline_outputs[prompt] = generate_text(prompt, model, tokenizer)
+
+print("✅ Baseline Outputs Saved")finetuned_outputs = {}
+
+for prompt in prompts:
+    finetuned_outputs[prompt] = generate_text(prompt, model, tokenizer)
+
+print("✅ Fine-tuned Outputs Saved")for prompt in prompts:
+    print("\n" + "="*60)
+    print(f"PROMPT: {prompt}")
+    print("-"*60)
+
+    print("🔹 BEFORE FINE-TUNING:")
+    print(baseline_outputs[prompt])
+
+    print("\n🔹 AFTER FINE-TUNING:")
+    print(finetuned_outputs[prompt])
