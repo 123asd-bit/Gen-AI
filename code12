@@ -1,0 +1,336 @@
+!pip -q install torchtext
+
+import os, re, ast, zipfile, urllib.request, random
+from collections import Counterurl = "https://www.cs.cornell.edu/~cristian/data/cornell_movie_dialogs_corpus.zip"
+zip_path = "/content/cornell_movie_dialogs_corpus.zip"
+extract_dir = "/content/cornell_data"
+
+if not os.path.exists(extract_dir):
+    os.makedirs(extract_dir, exist_ok=True)
+    urllib.request.urlretrieve(url, zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+data_dir = os.path.join(extract_dir, "cornell movie-dialogs corpus")
+print("Downloaded to:", data_dir)import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+
+import numpy as np
+import random
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)def clean_text(text):
+    text = text.lower().strip()
+    text = re.sub(r"[^a-zA-Z0-9\s']", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def load_lines(path):
+    id2line = {}
+    with open(path, encoding="iso-8859-1") as f:
+        for line in f:
+            parts = line.strip().split(" +++$+++ ")
+            if len(parts) == 5:
+                id2line[parts[0]] = clean_text(parts[4])
+    return id2line
+
+def load_pairs(lines_path, conv_path):
+    id2line = load_lines(lines_path)
+    pairs = []
+    with open(conv_path, encoding="iso-8859-1") as f:
+        for line in f:
+            parts = line.strip().split(" +++$+++ ")
+            if len(parts) == 4:
+                line_ids = ast.literal_eval(parts[3])
+                for i in range(len(line_ids) - 1):
+                    q = id2line.get(line_ids[i], "")
+                    a = id2line.get(line_ids[i + 1], "")
+                    if q and a:
+                        pairs.append((q, a))
+    return pairs
+
+lines_path = os.path.join(data_dir, "movie_lines.txt")
+conv_path = os.path.join(data_dir, "movie_conversations.txt")
+
+pairs = load_pairs(lines_path, conv_path)
+print("Total pairs:", len(pairs))
+
+MAX_PAIRS = 12000
+MAX_LEN = 15
+
+filtered_pairs = []
+for q, a in pairs:
+    if 1 <= len(q.split()) <= MAX_LEN and 1 <= len(a.split()) <= MAX_LEN:
+        filtered_pairs.append((q, a))
+
+random.shuffle(filtered_pairs)
+filtered_pairs = filtered_pairs[:MAX_PAIRS]
+print("Filtered pairs:", len(filtered_pairs))
+print("Sample pair:", filtered_pairs[0])PAD_TOKEN = "<pad>"
+SOS_TOKEN = "<sos>"
+EOS_TOKEN = "<eos>"
+UNK_TOKEN = "<unk>"
+
+special_tokens = [PAD_TOKEN, SOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
+
+counter = Counter()
+for q, a in filtered_pairs:
+    counter.update(q.split())
+    counter.update(a.split())
+
+vocab = {tok: i for i, tok in enumerate(special_tokens)}
+for word, freq in counter.items():
+    if freq >= 2:
+        vocab[word] = len(vocab)
+
+itos = {i: w for w, i in vocab.items()}
+
+PAD_IDX = vocab[PAD_TOKEN]
+SOS_IDX = vocab[SOS_TOKEN]
+EOS_IDX = vocab[EOS_TOKEN]
+UNK_IDX = vocab[UNK_TOKEN]
+
+print("Vocab size:", len(vocab))def encode(sentence):
+    return [vocab.get(w, UNK_IDX) for w in sentence.split()]
+
+class ChatDataset(Dataset):
+    def __init__(self, pairs):
+        self.data = []
+        for q, a in pairs:
+            src = [SOS_IDX] + encode(q) + [EOS_IDX]
+            trg = [SOS_IDX] + encode(a) + [EOS_IDX]
+            self.data.append((torch.tensor(src), torch.tensor(trg)))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def collate_fn(batch):
+    srcs, trgs = zip(*batch)
+    src_lens = torch.tensor([len(x) for x in srcs])
+    trg_lens = torch.tensor([len(x) for x in trgs])
+
+    srcs = pad_sequence(srcs, batch_first=True, padding_value=PAD_IDX)
+    trgs = pad_sequence(trgs, batch_first=True, padding_value=PAD_IDX)
+
+    return srcs, src_lens, trgs, trg_lens
+
+dataset = ChatDataset(filtered_pairs)
+train_size = int(0.9 * len(dataset))
+val_size = len(dataset) - train_size
+train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+BATCH_SIZE = 64
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)class Encoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim, hid_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD_IDX)
+        self.lstm = nn.LSTM(emb_dim, hid_dim, batch_first=True)
+
+    def forward(self, src, src_lens):
+        emb = self.embedding(src)
+        packed = pack_padded_sequence(emb, src_lens.cpu(), batch_first=True, enforce_sorted=False)
+        packed_out, (hidden, cell) = self.lstm(packed)
+        out, _ = pad_packed_sequence(packed_out, batch_first=True)
+        return out, hidden, cell
+
+class Attention(nn.Module):
+    def __init__(self, hid_dim):
+        super().__init__()
+        self.attn = nn.Linear(hid_dim * 2, hid_dim)
+        self.v = nn.Linear(hid_dim, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        seq_len = encoder_outputs.size(1)
+        hidden = hidden[-1].unsqueeze(1).repeat(1, seq_len, 1)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        scores = self.v(energy).squeeze(2)
+        return torch.softmax(scores, dim=1)
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim, hid_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD_IDX)
+        self.attention = Attention(hid_dim)
+        self.lstm = nn.LSTMCell(emb_dim + hid_dim, hid_dim)
+        self.fc_out = nn.Linear(emb_dim + hid_dim * 2, vocab_size)
+
+    def forward(self, input_token, hidden, cell, encoder_outputs):
+        input_token = input_token.unsqueeze(1)
+        emb = self.embedding(input_token).squeeze(1)
+
+        attn = self.attention(hidden, encoder_outputs)
+        context = torch.bmm(attn.unsqueeze(1), encoder_outputs).squeeze(1)
+
+        lstm_input = torch.cat((emb, context), dim=1)
+        hidden, cell = self.lstm(lstm_input, (hidden[-1], cell[-1]))
+
+        pred = self.fc_out(torch.cat((emb, hidden, context), dim=1))
+        return pred, hidden.unsqueeze(0), cell.unsqueeze(0), attn
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, src_lens, trg, teacher_forcing_ratio=0.5):
+        batch_size, trg_len = trg.shape
+        vocab_size = self.decoder.fc_out.out_features
+
+        outputs = torch.zeros(batch_size, trg_len, vocab_size).to(src.device)
+
+        encoder_outputs, hidden, cell = self.encoder(src, src_lens)
+        input_token = trg[:, 0]
+
+        for t in range(1, trg_len):
+            output, hidden, cell, _ = self.decoder(input_token, hidden, cell, encoder_outputs)
+            outputs[:, t] = output
+            teacher_force = random.random() < teacher_forcing_ratio
+            top1 = output.argmax(1)
+            input_token = trg[:, t] if teacher_force else top1
+
+        return outputs
+
+    def generate(self, src, src_lens, max_len=20):
+        self.eval()
+        with torch.no_grad():
+            encoder_outputs, hidden, cell = self.encoder(src, src_lens)
+            input_token = torch.tensor([SOS_IDX], device=src.device)
+
+            generated = []
+            attentions = []
+
+            for _ in range(max_len):
+                output, hidden, cell, attn = self.decoder(input_token, hidden, cell, encoder_outputs)
+                top1 = output.argmax(1).item()
+                if top1 == EOS_IDX:
+                    break
+                generated.append(top1)
+                attentions.append(attn.squeeze(0).cpu().numpy())
+                input_token = torch.tensor([top1], device=src.device)
+
+        return generated, attentionsEMB_DIM = 256
+HID_DIM = 256
+EPOCHS = 5
+LR = 0.001
+
+encoder = Encoder(len(vocab), EMB_DIM, HID_DIM).to(device)
+decoder = Decoder(len(vocab), EMB_DIM, HID_DIM).to(device)
+model = Seq2Seq(encoder, decoder).to(device)
+
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+def train_one_epoch():
+    model.train()
+    total_loss = 0
+
+    for src, src_lens, trg, trg_lens in train_loader:
+        src, src_lens, trg = src.to(device), src_lens.to(device), trg.to(device)
+
+        optimizer.zero_grad()
+        output = model(src, src_lens, trg, teacher_forcing_ratio=0.5)
+
+        output = output[:, 1:].reshape(-1, output.shape[-1])
+        trg_y = trg[:, 1:].reshape(-1)
+
+        loss = criterion(output, trg_y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(train_loader)
+
+def evaluate():
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
+        for src, src_lens, trg, trg_lens in val_loader:
+            src, src_lens, trg = src.to(device), src_lens.to(device), trg.to(device)
+            output = model(src, src_lens, trg, teacher_forcing_ratio=0.0)
+
+            output = output[:, 1:].reshape(-1, output.shape[-1])
+            trg_y = trg[:, 1:].reshape(-1)
+
+            loss = criterion(output, trg_y)
+            total_loss += loss.item()
+
+    return total_loss / len(val_loader)
+
+for epoch in range(EPOCHS):
+    train_loss = train_one_epoch()
+    val_loss = evaluate()
+    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")def sentence_to_tensor(sentence):
+    sentence = clean_text(sentence)
+    ids = [SOS_IDX] + encode(sentence) + [EOS_IDX]
+    return torch.tensor(ids).unsqueeze(0)
+
+def reply(sentence, max_len=20):
+    src = sentence_to_tensor(sentence).to(device)
+    src_lens = torch.tensor([src.shape[1]]).to(device)
+    pred_ids, attn = model.generate(src, src_lens, max_len=max_len)
+    words = [itos.get(i, UNK_TOKEN) for i in pred_ids]
+    return " ".join(words), attn
+
+tests = [
+    "hello",
+    "how are you",
+    "what are you doing",
+    "do you like movies"
+]def show_attention(sentence):
+    src_clean = clean_text(sentence)
+    src_words = src_clean.split()
+    src = sentence_to_tensor(sentence).to(device)
+    src_lens = torch.tensor([src.shape[1]]).to(device)
+
+    pred_ids, attn_list = model.generate(src, src_lens, max_len=10)
+    out_words = [itos.get(i, UNK_TOKEN) for i in pred_ids]
+
+    print("Input words :", src_words)
+    print("Output words:", out_words)
+
+    if attn_list:
+        first_attn = attn_list[0]
+        top_idx = int(np.argmax(first_attn))
+        if top_idx < len(src_words):
+            print("Most attended input word for first generated token:", src_words[top_idx])
+
+show_attention("how are you")def chat():
+    print("🤖 Chatbot ready! Type 'quit' to exit.\n")
+
+    while True:
+        user_input = input("You: ")
+
+        if user_input.lower() in ["quit", "exit", "bye"]:
+            print("Bot: Goodbye!")
+            break
+
+        # generate reply
+        response, _ = reply(user_input)
+
+        if response.strip() == "":
+            response = "i don't know what to say"
+
+        print("Bot:", response)
+        print()
+
+chat()
+
+for t in tests:
+    out, _ = reply(t)
+    print("Input :", t)
+    print("Output:", out)
+    print("-" * 50)
